@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 本地产物 / 备份（切勿提交应用二进制或用户数据）
+*.asar
+*.asar.bak
+*.asar.new
+*.agzh_new
+*.agzh-old-*
+*.agzh-failed-*
+.antigravity-zh-backup/
+app.asar.unpacked/
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.log

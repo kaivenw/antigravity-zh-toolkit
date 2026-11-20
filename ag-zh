@@ -1,0 +1,356 @@
+#!/usr/bin/env bash
+# ag-zh - Antigravity 中文汉化 / 可恢复管理器（macOS、Linux）
+#
+#   ag-zh status         查看汉化状态、备份校验与签名
+#   ag-zh install        安装/刷新汉化（首次会自动做整包备份）
+#   ag-zh backup-full    单独创建整包备份
+#   ag-zh restore        还原英文原版（只替换 app.asar）
+#   ag-zh restore-full   整包回滚到备份状态（含 macOS 官方签名）
+#   ag-zh help           显示本帮助
+#
+# 约定：修改前要求 Antigravity 已完全退出；restore-full 把当前应用改名保留而非删除。
+# 环境变量：AGZH_ASAR（自定义 app.asar）、AGZH_BACKUP_ROOT、AGZH_PYTHON、AGZH_FULL_BAK。
+set -euo pipefail
+
+# 解析 symlink，保证通过 PATH 里的软链接调用时也能找到仓库文件
+_src="${BASH_SOURCE[0]}"
+while [ -L "$_src" ]; do
+  _dir=$(cd -P "$(dirname "$_src")" && pwd)
+  _src=$(readlink "$_src")
+  [[ "$_src" != /* ]] && _src="$_dir/$_src"
+done
+REPO=$(cd -P "$(dirname "$_src")" && pwd)
+INSTALLER="$REPO/install.py"
+PYTHON="${AGZH_PYTHON:-python3}"
+BACKUP_ROOT="${AGZH_BACKUP_ROOT:-$HOME/.antigravity-zh-backup}"
+MANIFEST="$BACKUP_ROOT/manifest.json"
+EXT_DICT="$HOME/.antigravity-zh/zh-CN.json"
+UNAME=$(uname -s)
+
+sha() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'
+  else sha256sum "$1" | awk '{print $1}'; fi
+}
+
+# 不用 grep 管道：pipefail 下 grep -m1 提前退出会让 codesign 收到 SIGPIPE 而误判失败
+_codesign_field() {
+  local out line prefix="$2"
+  out=$(codesign -dv --verbose=2 "$1" 2>&1) || true
+  while IFS= read -r line; do
+    case "$line" in "$prefix"*) printf '%s\n' "${line#"$prefix"}"; return 0 ;; esac
+  done <<< "$out"
+  echo "none"
+}
+sig()       { _codesign_field "$1" "Signature="; }
+authority() { _codesign_field "$1" "Authority="; }
+
+verify_signature() {
+  if [ "$UNAME" = "Darwin" ]; then
+    codesign --verify --deep --verbose=0 "$1" >/dev/null 2>&1
+  else
+    return 0
+  fi
+}
+
+running() {
+  case "$UNAME" in
+    Darwin) pgrep -f "Antigravity.app/Contents/MacOS" >/dev/null 2>&1 ;;
+    Linux)  pgrep -x Antigravity >/dev/null 2>&1 || pgrep -x antigravity >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+require_idle() {
+  if running; then
+    echo "[!] Antigravity 正在运行，请先完全退出（Cmd+Q）再执行本操作。" >&2
+    exit 1
+  fi
+}
+
+require_installer() {
+  if [ ! -f "$INSTALLER" ] || [ ! -f "$REPO/dicts/zh_cn.json" ]; then
+    echo "[ERR] 仓库文件不完整: $REPO" >&2
+    exit 1
+  fi
+}
+
+# 把 install.py --info 的 JSON 转成 I_<KEY> shell 变量
+load_info() {
+  local raw
+  raw=$("$PYTHON" "$INSTALLER" --info) || {
+    echo "[ERR] 无法读取安装信息，请确认已安装 Python 3 且路径可用。" >&2
+    exit 1
+  }
+  eval "$(printf '%s\n' "$raw" | "$PYTHON" -c '
+import json, sys, shlex
+d = json.load(sys.stdin)
+for k, v in d.items():
+    print("I_%s=%s" % (k.upper(), shlex.quote(str(v))))
+')"
+  if [ "${I_EXISTS:-False}" != "True" ]; then
+    echo "[ERR] 找不到 app.asar: ${I_ASAR:-?}" >&2
+    exit 1
+  fi
+  BAK="$I_ASAR.bak"
+  REL_ASAR="${I_ASAR#"$I_APP_ROOT"/}"
+}
+
+backup_dir_for() {
+  case "$UNAME" in
+    Darwin) printf '%s/Antigravity-%s.app\n' "$BACKUP_ROOT" "$1" ;;
+    *)      printf '%s/Antigravity-%s\n' "$BACKUP_ROOT" "$1" ;;
+  esac
+}
+
+copy_tree() {
+  if [ "$UNAME" = "Darwin" ] && command -v ditto >/dev/null 2>&1; then
+    ditto "$1" "$2"
+  else
+    cp -a "$1" "$2"
+  fi
+}
+
+mfield() {
+  "$PYTHON" -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+v = d.get(sys.argv[2], "")
+print("" if v is None else v)
+' "$MANIFEST" "$1" 2>/dev/null || true
+}
+
+locate_full_backup() {
+  FULL_BAK=""
+  if [ -n "${AGZH_FULL_BAK:-}" ]; then
+    FULL_BAK="$AGZH_FULL_BAK"
+  elif [ -f "$MANIFEST" ]; then
+    FULL_BAK=$(mfield full_app_backup)
+  fi
+}
+
+write_manifest() {
+  "$PYTHON" - "$MANIFEST" "${I_VERSION:-}" "$I_APP_ROOT" "$I_ASAR" "$1" "$2" "$3" <<'PY'
+import json, sys, datetime, os
+p, version, app_root, asar, backup, official, bsha = sys.argv[1:8]
+d = {
+    "schema": 1,
+    "created_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+    "platform": sys.platform,
+    "version": version,
+    "app_root": app_root,
+    "asar": asar,
+    "full_app_backup": backup,
+    "backup_asar_sha256": bsha,
+    "official_asar_sha256": official,
+    "patch_source": "https://github.com/zhonghugo/antigravity-zh (MIT)",
+    "tools": ["ag-zh (macOS/Linux)", "ag-zh.ps1 (Windows)"],
+    "commands": ["status", "backup-full", "install", "restore", "restore-full"],
+    "notes": [
+        "install 会在修改前自动创建整包备份",
+        "restore 只替换 app.asar；restore-full 整包回滚",
+        "官方升级后重跑 install；整包备份按版本分别保存",
+    ],
+}
+if os.path.exists(p):
+    try:
+        old = json.load(open(p, encoding="utf-8"))
+        d["previous"] = {k: old.get(k) for k in
+                         ("created_at", "version", "full_app_backup") if old.get(k)}
+    except Exception:
+        pass
+with open(p, "w", encoding="utf-8") as f:
+    json.dump(d, f, ensure_ascii=False, indent=2)
+print("[OK] 备份清单已更新: " + p)
+PY
+}
+
+# install 前自动建立「未修改状态」的整包备份；已存在同版本备份则复用
+ensure_full_backup() {
+  locate_full_backup
+  if [ -n "$FULL_BAK" ] && [ -d "$FULL_BAK" ] && [ "$(mfield version)" = "${I_VERSION:-}" ]; then
+    echo "[*] 复用整包备份: $FULL_BAK"
+    return 0
+  fi
+  local dest official bsha
+  dest=$(backup_dir_for "${I_VERSION:-unknown}")
+  if [ -e "$dest" ]; then
+    echo "[*] 已存在同版本备份，直接复用: $dest"
+    FULL_BAK="$dest"
+  else
+    mkdir -p "$BACKUP_ROOT"
+    echo "[*] 首次汉化，正在创建整包备份（可能几百 MB，请稍候）..."
+    if ! copy_tree "$I_APP_ROOT" "$dest"; then
+      echo "[ERR] 整包备份失败，已中止汉化以保证可恢复。" >&2
+      exit 1
+    fi
+    FULL_BAK="$dest"
+  fi
+  if ! verify_signature "$FULL_BAK"; then
+    echo "[ERR] 整包备份签名校验失败，已中止。" >&2
+    exit 1
+  fi
+  if [ ! -f "$FULL_BAK/$REL_ASAR" ]; then
+    echo "[ERR] 整包备份缺少 $REL_ASAR，已中止。" >&2
+    exit 1
+  fi
+  bsha=$(sha "$FULL_BAK/$REL_ASAR")
+  official="${I_BACKUP_SHA256:-}"
+  if [ -z "$official" ] || [ "$official" = "None" ]; then official="$I_SHA256"; fi
+  write_manifest "$FULL_BAK" "$official" "$bsha"
+  echo "[OK] 整包备份就绪: $FULL_BAK"
+}
+
+# restore 依赖官方原版 app.asar.bak；被官方更新器清掉时从整包备份补齐
+ensure_official_backup() {
+  if [ -f "$BAK" ]; then return 0; fi
+  locate_full_backup
+  local src expected
+  src="$FULL_BAK/$REL_ASAR"
+  expected=$(mfield official_asar_sha256)
+  if [ -z "$FULL_BAK" ] || [ ! -f "$src" ]; then
+    echo "[ERR] 官方原版备份缺失且整包备份不可用，无法保证可恢复。" >&2
+    exit 1
+  fi
+  if [ -n "$expected" ] && [ "$(sha "$src")" != "$expected" ]; then
+    echo "[ERR] 整包备份中的 asar 不是官方原版，拒绝用它生成 .bak。" >&2
+    exit 1
+  fi
+  cp -p "$src" "$BAK"
+  echo "[OK] 已从整包备份补齐官方原版 app.asar.bak"
+}
+
+cmd_status() {
+  echo "== Antigravity 汉化状态 =="
+  echo "平台           : $UNAME / ${I_PLATFORM:-}"
+  echo "版本           : ${I_VERSION:-?}"
+  echo "应用根目录     : $I_APP_ROOT"
+  if [ "$UNAME" = "Darwin" ]; then
+    local a
+    a=$(authority "$I_APP_ROOT")
+    [ "$a" = "none" ] && a="自签名（汉化重签名后的正常状态）"
+    echo "签名           : $(sig "$I_APP_ROOT")  ($a)"
+  fi
+  echo
+  echo "当前 app.asar  : $I_SHA256"
+  if [ -f "$BAK" ]; then
+    echo "官方原版 .bak  : $(sha "$BAK")"
+    if [ "$I_SHA256" = "$(sha "$BAK")" ]; then
+      echo "界面模式       : 英文原版（未汉化）"
+    else
+      echo "界面模式       : 中文汉化版"
+    fi
+  else
+    echo "官方原版 .bak  : 缺失（install 会自动补齐）"
+  fi
+  echo "引擎注入检测   : ${I_LOCALIZED:-unknown}"
+  echo "词典词条       : ${I_DICTIONARY_ENTRIES:-?}"
+  echo
+  locate_full_backup
+  if [ -n "$FULL_BAK" ] && [ -d "$FULL_BAK" ]; then
+    echo "整包备份       : $FULL_BAK  [备份版本 $(mfield version)]"
+    if verify_signature "$FULL_BAK"; then echo "整包备份校验   : 通过"; else echo "整包备份校验   : 失败"; fi
+  else
+    echo "整包备份       : 缺失（运行 ag-zh install 会自动创建）"
+  fi
+  echo
+  if [ -f "$EXT_DICT" ]; then
+    echo "热重载词典     : $EXT_DICT"
+    echo "                 编辑后自动生效，无需重装"
+  fi
+  echo
+  echo "可用命令: ag-zh status | install | backup-full | restore | restore-full | help"
+}
+
+cmd_backup_full() {
+  require_installer
+  load_info
+  echo "[*] 创建整包备份（当前状态快照）..."
+  unset AGZH_FULL_BAK
+  ensure_full_backup
+}
+
+cmd_install() {
+  require_idle
+  require_installer
+  load_info
+  ensure_full_backup
+  ensure_official_backup
+  echo "[*] 安装 / 刷新中文汉化 ..."
+  "$PYTHON" "$INSTALLER"
+  echo "[OK] 完成。启动 Antigravity 查看中文界面。"
+  echo "[i]  随时可用 ag-zh restore 或 ag-zh restore-full 恢复。"
+}
+
+cmd_restore() {
+  require_idle
+  require_installer
+  ensure_official_backup
+  echo "[*] 还原官方原版 app.asar ..."
+  "$PYTHON" "$INSTALLER" --restore
+  local a b
+  a=$(sha "$I_ASAR"); b=$(sha "$BAK")
+  if [ "$a" != "$b" ]; then
+    echo "[ERR] 还原后校验失败（$a != $b）" >&2
+    exit 1
+  fi
+  echo "[OK] 已回到英文原版，SHA256 校验通过。"
+  if [ "$UNAME" = "Darwin" ]; then
+    echo "[i]  签名仍为 ad-hoc；如需 Google 官方签名，执行 ag-zh restore-full"
+  fi
+}
+
+cmd_restore_full() {
+  require_idle
+  locate_full_backup
+  if [ -z "$FULL_BAK" ] || [ ! -d "$FULL_BAK" ] || [ ! -f "$FULL_BAK/$REL_ASAR" ]; then
+    echo "[ERR] 整包备份不存在或不完整: ${FULL_BAK:-<未配置>}" >&2
+    exit 1
+  fi
+  if ! verify_signature "$FULL_BAK"; then
+    echo "[ERR] 整包备份签名校验失败，已中止。" >&2
+    exit 1
+  fi
+  local bsha stamp old cur_ver bak_ver
+  bsha=$(sha "$FULL_BAK/$REL_ASAR")
+  cur_ver="${I_VERSION:-?}"; bak_ver=$(mfield version)
+  if [ -n "$bak_ver" ] && [ "$cur_ver" != "$bak_ver" ]; then
+    echo "[!] 注意：当前版本 $cur_ver，备份版本 $bak_ver；完整恢复会回退到 $bak_ver。"
+  fi
+  stamp=$(date +%Y%m%d_%H%M%S)
+  old="$I_APP_ROOT.agzh-old-$stamp"
+  echo "[*] 保留当前应用到: $old"
+  if ! mv "$I_APP_ROOT" "$old"; then
+    echo "[ERR] 无法移动 $I_APP_ROOT（需要上级目录写权限）" >&2
+    exit 1
+  fi
+  if ! copy_tree "$FULL_BAK" "$I_APP_ROOT"; then
+    echo "[!] 恢复失败，正在回滚 ..." >&2
+    [ -e "$I_APP_ROOT" ] && mv "$I_APP_ROOT" "$I_APP_ROOT.agzh-failed-$stamp"
+    mv "$old" "$I_APP_ROOT"
+    exit 1
+  fi
+  if verify_signature "$I_APP_ROOT" && [ "$(sha "$I_ASAR")" = "$bsha" ]; then
+    echo "[OK] 完整恢复成功，asar SHA256 校验通过。"
+    echo "[i]  当前版本已保留在: $old"
+    echo "     确认无误后可手动删除（建议移到废纸篓，不要直接 rm -rf）"
+  else
+    echo "[ERR] 恢复后校验未通过，请检查 $I_APP_ROOT 与 $old" >&2
+    exit 1
+  fi
+}
+
+cmd_help() {
+  awk 'NR > 1 { if ($0 ~ /^#/) { sub(/^# ?/, ""); print } else exit }' "$0"
+}
+
+case "${1:-help}" in
+  status)        require_installer; load_info; cmd_status ;;
+  backup-full)   cmd_backup_full ;;
+  install|reinstall) cmd_install ;;
+  restore)       require_installer; load_info; cmd_restore ;;
+  restore-full)  require_installer; load_info; cmd_restore_full ;;
+  help|-h|--help|*) cmd_help ;;
+esac
